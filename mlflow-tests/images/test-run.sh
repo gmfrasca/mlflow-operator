@@ -1,8 +1,10 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 set -o allexport
-source ./images/.env
-source ./images/patch-csv.sh
+source "$SCRIPT_DIR/.env"
+source "$SCRIPT_DIR/patch-csv.sh"
 set +o allexport
 
 RANDOM_SUFFIX=$(head /dev/urandom | tr -dc a-z0-9 | head -c 8)

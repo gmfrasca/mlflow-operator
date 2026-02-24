@@ -1,8 +1,7 @@
 #!/bin/bash
 
-set -o allexport
-source images/.env
-set +o allexport
+export OPERATOR_NAMESPACE_ODH="opendatahub"
+export OPERATOR_NAMESPACE_RHOAI="redhat-ods-operator"
 
 # Function to patch CSV
 patch_csv() {
@@ -31,7 +30,7 @@ patch_csv() {
     base_config_path=$(download_and_prepare_mlflow_operator_manifests "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH")
     if [[ $? -ne 0 || -z "$base_config_path" ]]; then
         echo "ERROR: Failed to download and prepare MLflow operator manifests"
-        exit 1
+        return 1
     fi
 
     # Step 3: Apply CSV patch and wait for operator pod readiness
@@ -39,15 +38,15 @@ patch_csv() {
     operator_label=$(apply_csv_patch_and_wait_for_mlflow_operator "$CSV_NAME" "$NAMESPACE_NAME" "$overlays_dir")
     if [[ $? -ne 0 || -z "$operator_label" ]]; then
         echo "ERROR: Failed to apply CSV patch or wait for MLflow operator pod readiness"
-        exit 1
+        return 1
     fi
 
     # Step 4: Copy MLflow operator manifests to the operator pods
     copy_mlflow_operator_manifests_to_pods "$base_config_path" "$operator_label" "$NAMESPACE_NAME"
     local copy_result=$?
-    if [[ $copy_result -eq 1 ]]; then
-        echo "ERROR: Failed to copy custom manifests to any pods"
-        exit 1
+    if [[ $copy_result -ne 0 ]]; then
+        echo "ERROR: Failed to copy custom manifests to any pods (exit code: $copy_result)"
+        return 1
     fi
 
     # Step 5: Restart operator deployment
@@ -61,7 +60,7 @@ patch_csv() {
             echo "Operator deployment rollout completed successfully"
         else
             echo "Warning: Deployment rollout did not complete within timeout"
-            exit 1
+            return 1
         fi
     else
         echo "Failed to restart operator deployment"
@@ -69,7 +68,7 @@ patch_csv() {
     fi
 
     # Step 6: Wait for MLflow operator controller manager pod to be running
-    wait_for_mlflow_operator_controller_manager "$NAMESPACE_NAME"
+    wait_for_mlflow_operator_controller_manager "$NAMESPACE_NAME" || return 1
 
     echo "Finished patching mlflow-operator component for CSV: $CSV_NAME"
 }
@@ -98,9 +97,9 @@ apply_csv_patch_and_wait_for_mlflow_operator() {
 
     echo "Waiting for operator pod to be ready..." >&2
     local operator_label=""
-    if [[ "$namespace_name" == "redhat-ods-operator" ]]; then
+    if [[ "$namespace_name" == "$OPERATOR_NAMESPACE_RHOAI" ]]; then
         operator_label="name=rhods-operator"
-    elif [[ "$namespace_name" == "openshift-operators" ]]; then
+    elif [[ "$namespace_name" == "$OPERATOR_NAMESPACE_ODH" ]]; then
         operator_label="name=opendatahub-operator"
     else
         echo "Unknown namespace: $namespace_name, using generic operator label" >&2
@@ -267,8 +266,7 @@ wait_for_mlflow_operator_controller_manager() {
     done
 
     if [[ $mlflow_operator_pod_ready == false ]]; then
-        echo "WARNING: MLflow operator controller manager pod did not become ready within ${max_wait_time} seconds"
-        echo "This may indicate an issue with the MLflow operator deployment, but continuing..."
+        echo "ERROR: MLflow operator controller manager pod did not become ready within ${max_wait_time} seconds"
         return 1
     fi
 
@@ -284,39 +282,42 @@ find_csv_and_update() {
     echo "Checking for operator namespaces and updating CSV images..."
 
     # Get list of all namespaces
+    local NAMESPACE_LIST
     NAMESPACE_LIST=$(oc get namespaces -o jsonpath='{.items[*].metadata.name}')
 
-    # Check for redhat-ods-operator namespace
-    if echo "$NAMESPACE_LIST" | grep -q "redhat-ods-operator"; then
-        echo "Found redhat-ods-operator namespace, updating rhods-operator CSV..."
+    # Check for RHOAI Applications namespace
+    if echo "$NAMESPACE_LIST" | grep -q "$OPERATOR_NAMESPACE_RHOAI"; then
+        echo "Found $OPERATOR_NAMESPACE_RHOAI namespace, updating rhods-operator CSV..."
 
         # Get CSV matching rhods-operator*
-        RHODS_CSV=$(oc get csv -n redhat-ods-operator --no-headers | grep "rhods-operator" | awk '{print $1}' | head -1)
+        local RHODS_CSV
+        RHODS_CSV=$(oc get csv -n "$OPERATOR_NAMESPACE_RHOAI" --no-headers | grep "rhods-operator" | awk '{print $1}' | head -1)
 
         if [[ -n "$RHODS_CSV" ]]; then
             echo "Found RHODS CSV: $RHODS_CSV"
-            patch_csv "$RHODS_CSV" "redhat-ods-operator" "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH"
+            patch_csv "$RHODS_CSV" "$OPERATOR_NAMESPACE_RHOAI" "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH" || return 1
          else
-            echo "No rhods-operator CSV found in redhat-ods-operator namespace"
-            exit 1
+            echo "No rhods-operator CSV found in $OPERATOR_NAMESPACE_RHOAI namespace"
+            return 1
         fi
-    # Check for openshift-operators namespace
-    elif echo "$NAMESPACE_LIST" | grep -q "openshift-operators"; then
-        echo "Found openshift-operators namespace, updating opendatahub-operator CSV..."
+    # Check for ODH Applications namespace
+    elif echo "$NAMESPACE_LIST" | grep -q "$OPERATOR_NAMESPACE_ODH"; then
+        echo "Found $OPERATOR_NAMESPACE_ODH namespace, updating opendatahub-operator CSV..."
 
         # Get CSV matching opendatahub-operator*
-        ODH_CSV=$(oc get csv -n openshift-operators --no-headers | grep "opendatahub-operator" | awk '{print $1}' | head -1)
+        local ODH_CSV
+        ODH_CSV=$(oc get csv -n "$OPERATOR_NAMESPACE_ODH" --no-headers | grep "opendatahub-operator" | awk '{print $1}' | head -1)
 
         if [[ -n "$ODH_CSV" ]]; then
             echo "Found ODH CSV: $ODH_CSV"
-            patch_csv "$ODH_CSV" "openshift-operators" "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH"
+            patch_csv "$ODH_CSV" "$OPERATOR_NAMESPACE_ODH" "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH" || return 1
         else
-            echo "No opendatahub-operator CSV found in openshift-operators namespace"
-            exit 1
+            echo "No opendatahub-operator CSV found in $OPERATOR_NAMESPACE_ODH namespace"
+            return 1
         fi
     else
       echo "No RHOAI or ODH operator found, exiting..."
-      exit 1
+      return 1
     fi
 
     echo "Finished checking and updating operator CSV images"

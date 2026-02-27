@@ -230,8 +230,9 @@ class MLflowDeployer:
         encoded_user = quote_plus(self.args.postgres_user)
         encoded_pass = quote_plus(self.args.postgres_password)
 
-        backend_uri = f"postgresql://{encoded_user}:{encoded_pass}@{self.args.postgres_host}:{self.args.postgres_port}/{self.args.postgres_backend_db}"
-        registry_uri = f"postgresql://{encoded_user}:{encoded_pass}@{self.args.postgres_host}:{self.args.postgres_port}/{self.args.postgres_registry_db}"
+        sslmode_param = f"?sslmode={self.args.postgres_sslmode}" if self.args.postgres_sslmode else ""
+        backend_uri = f"postgresql://{encoded_user}:{encoded_pass}@{self.args.postgres_host}:{self.args.postgres_port}/{self.args.postgres_backend_db}{sslmode_param}"
+        registry_uri = f"postgresql://{encoded_user}:{encoded_pass}@{self.args.postgres_host}:{self.args.postgres_port}/{self.args.postgres_registry_db}{sslmode_param}"
 
         # Delete existing secret if it exists
         self.run_command([
@@ -983,6 +984,9 @@ def main():
                        help="SeaweedFS container image (default: chrislusf/seaweedfs:4.07)")
 
     # PostgreSQL configuration
+    parser.add_argument("--postgres-sslmode", default="disable",
+                       help="PostgreSQL sslmode appended to the connection URI "
+                            "(e.g. disable, require, verify-full). Use empty string to omit.")
     parser.add_argument("--postgres-host", default="")
     parser.add_argument("--postgres-port", default="5432")
     parser.add_argument("--postgres-user", default="postgres")

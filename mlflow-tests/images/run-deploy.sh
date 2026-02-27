@@ -62,6 +62,25 @@ SKIP_OPERATOR="${SKIP_OPERATOR:-false}"
 # Credentials secrets are always created regardless of this flag.
 SKIP_INFRASTRUCTURE="${SKIP_INFRASTRUCTURE:-false}"
 
+# Platform for infrastructure overlays.  Automatically set to "openshift" when
+# DEPLOY_MLFLOW_OPERATOR=true (OLM / OpenShift), otherwise defaults to "kind".
+# Override explicitly with PLATFORM=openshift|kind if needed.
+if [ -z "${PLATFORM:-}" ]; then
+    if [ "${DEPLOY_MLFLOW_OPERATOR:-false}" = "true" ]; then
+        PLATFORM="openshift"
+    else
+        PLATFORM="kind"
+    fi
+fi
+
+# Infrastructure image overrides (defaults avoid Docker Hub rate limits when set).
+POSTGRES_IMAGE="${POSTGRES_IMAGE:-}"
+SEAWEEDFS_IMAGE="${SEAWEEDFS_IMAGE:-}"
+
+# PostgreSQL sslmode appended to the connection URI (e.g. "disable", "require").
+# Leave empty to omit the sslmode parameter entirely.
+DB_SSLMODE="${DB_SSLMODE:-}"
+
 MLFLOW_TAG="master"
 MLFLOW_IMAGE_REPO="quay.io/opendatahub/mlflow"
 MLFLOW_IMAGE=""
@@ -170,6 +189,25 @@ cleanup() {
         -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
     kubectl delete clusterrolebinding "mlflow-auth-delegator-${MLFLOW_NAME}" \
         --ignore-not-found 2>/dev/null || true
+
+    # Tear down infrastructure only if it was deployed by this script
+    if [ "$SKIP_INFRASTRUCTURE" != "true" ]; then
+        _INFRA_OVERLAY="${PLATFORM:-kind}"
+        if [ "$DB_TYPE" = "postgres" ] || [ "$DB_TYPE" = "postgresql" ]; then
+            echo "  Removing PostgreSQL..."
+            kustomize build "$REPO_ROOT/config/postgres/$_INFRA_OVERLAY" \
+                | kubectl delete --ignore-not-found -n "$NAMESPACE" -f - 2>/dev/null || true
+        fi
+        if [ "$STORAGE_TYPE" = "s3" ]; then
+            echo "  Removing SeaweedFS..."
+            export APPLICATION_CRD_ID=mlflow-pipelines \
+                   PROFILE_NAMESPACE_LABEL=mlflow-profile \
+                   S3_ADMIN_USER=kind-admin
+            kustomize build "$REPO_ROOT/config/seaweedfs/$_INFRA_OVERLAY" \
+                | envsubst '$NAMESPACE,$APPLICATION_CRD_ID,$PROFILE_NAMESPACE_LABEL,$S3_ADMIN_USER' \
+                | kubectl delete --ignore-not-found -f - 2>/dev/null || true
+        fi
+    fi
 }
 
 if [ "$SKIP_CLEANUP" != "true" ]; then
@@ -214,7 +252,12 @@ else
         --namespace             "$NAMESPACE"
         --mlflow-image          "$MLFLOW_RESOLVED_IMAGE"
         --mlflow-operator-image "$MLFLOW_OPERATOR_IMAGE"
+        --platform              "$PLATFORM"
     )
+
+    [ -n "${POSTGRES_IMAGE:-}"  ] && DEPLOY_ARGS+=(--postgres-image  "$POSTGRES_IMAGE")
+    [ -n "${SEAWEEDFS_IMAGE:-}" ] && DEPLOY_ARGS+=(--seaweedfs-image "$SEAWEEDFS_IMAGE")
+    [ -n "${DB_SSLMODE:-}"      ] && DEPLOY_ARGS+=(--postgres-sslmode "$DB_SSLMODE")
 
     # Operator deployment: skip when OLM manages it, or when explicitly requested
     if [ "$DEPLOY_MLFLOW_OPERATOR" = "true" ] || [ "$SKIP_OPERATOR" = "true" ]; then

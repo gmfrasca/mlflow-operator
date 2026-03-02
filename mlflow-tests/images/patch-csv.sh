@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export OPERATOR_NAMESPACE_ODH="opendatahub"
+export OPERATOR_NAMESPACE_ODH="openshift-operators"
 export OPERATOR_NAMESPACE_RHOAI="redhat-ods-operator"
 
 # Function to patch CSV
@@ -298,7 +298,7 @@ find_csv_and_update() {
     local NAMESPACE_LIST
     NAMESPACE_LIST=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}')
 
-    # Check for RHOAI Applications namespace
+    # Check for RHOAI Operator namespace
     if echo "$NAMESPACE_LIST" | grep -q "$OPERATOR_NAMESPACE_RHOAI"; then
         echo "Found $OPERATOR_NAMESPACE_RHOAI namespace, updating rhods-operator CSV..."
 
@@ -313,24 +313,23 @@ find_csv_and_update() {
             echo "No rhods-operator CSV found in $OPERATOR_NAMESPACE_RHOAI namespace"
             return 1
         fi
-    # Check for ODH Applications namespace
-    elif echo "$NAMESPACE_LIST" | grep -q "$OPERATOR_NAMESPACE_ODH"; then
+    # Check for ODH operator namespace
+    elif echo "$NAMESPACE_LIST" | grep -qw "$OPERATOR_NAMESPACE_ODH"; then
         echo "Found $OPERATOR_NAMESPACE_ODH namespace, updating opendatahub-operator CSV..."
 
-        # Get CSV matching opendatahub-operator*
         local ODH_CSV
-        ODH_CSV=$(kubectl get csv -n "$OPERATOR_NAMESPACE_ODH" --no-headers | grep "opendatahub-operator" | awk '{print $1}' | head -1)
+        ODH_CSV=$(kubectl get csv -n "$OPERATOR_NAMESPACE_ODH" --no-headers 2>/dev/null | awk '/opendatahub-operator/{print $1}' | head -1)
 
         if [[ -n "$ODH_CSV" ]]; then
             echo "Found ODH CSV: $ODH_CSV"
             patch_csv "$ODH_CSV" "$OPERATOR_NAMESPACE_ODH" "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH" || return 1
         else
-            echo "No opendatahub-operator CSV found in $OPERATOR_NAMESPACE_ODH namespace"
+            echo "No opendatahub-operator CSV found in $OPERATOR_NAMESPACE_ODH"
             return 1
         fi
     else
-      echo "No RHOAI or ODH operator found, exiting..."
-      return 1
+        echo "No RHOAI or ODH operator found, exiting..."
+        return 1
     fi
 
     echo "Finished checking and updating operator CSV images"

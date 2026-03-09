@@ -42,7 +42,7 @@ MLflow image:
   MLFLOW_IMAGE          Full image reference; overrides MLFLOW_TAG when set
   MLFLOW_TAG            Image tag for MLFLOW_IMAGE_REPO (default: master)
   MLFLOW_IMAGE_REPO     Image repository (default: quay.io/opendatahub/mlflow)
-  MLFLOW_OPERATOR_IMAGE Full MLflow operator image reference
+  MLFLOW_OPERATOR_IMAGE MLflow operator image (standalone/Kind path only; ODH/RHOAI operator image is hardcoded in the platform binary)
 
 Storage:
   STORAGE_TYPE          Legacy single-suite selector: file|s3. Prefer ARTIFACT_BACKENDS for
@@ -149,11 +149,10 @@ STORAGE_TYPE="${STORAGE_TYPE:-file}"
 TEST_LABELS="${TEST_LABELS:-}"
 
 # Platform for infrastructure overlays: base|openshift.
-# Auto-detected from DEPLOY_MLFLOW_OPERATOR when not explicitly set:
-#   DEPLOY_MLFLOW_OPERATOR=true  → openshift  (OLM/CSV path implies OpenShift)
-#   DEPLOY_MLFLOW_OPERATOR=false → base       (kustomize-direct path implies base)
+# Defaults to openshift when the cluster has the OpenShift API (oc/routes available),
+# otherwise falls back to base. Can always be overridden explicitly.
 if [ -z "${INFRASTRUCTURE_PLATFORM:-}" ]; then
-    if [ "$DEPLOY_MLFLOW_OPERATOR" = "true" ]; then
+    if kubectl api-resources --api-group=route.openshift.io &>/dev/null 2>&1; then
         INFRASTRUCTURE_PLATFORM="openshift"
     else
         INFRASTRUCTURE_PLATFORM="base"

@@ -72,8 +72,8 @@ Operator / OpenShift:
   MLFLOW_OPERATOR_OWNER   GitHub owner for CSV manifest download (default: opendatahub-io)
   MLFLOW_OPERATOR_REPO    GitHub repo for CSV manifest download  (default: mlflow-operator)
   MLFLOW_OPERATOR_BRANCH  GitHub branch for CSV manifest download (default: main)
-  INFRASTRUCTURE_PLATFORM Infrastructure overlay: kind|openshift
-                          (default: openshift when DEPLOY_MLFLOW_OPERATOR=true, else kind)
+  INFRASTRUCTURE_PLATFORM Infrastructure overlay: base|openshift
+                          (default: openshift when DEPLOY_MLFLOW_OPERATOR=true, else base)
 
 Skip / control flags:
   SKIP_DEPLOYMENT       true|false — skip all cluster deployment (default: false)
@@ -126,7 +126,7 @@ DB_TYPE="${DB_TYPE:-sqlite}"
 # When true the script patches the OLM CSV instead of deploying the operator via kustomize
 # and passes --skip-operator to deploy.py. Infrastructure is NOT automatically skipped —
 # set SKIP_INFRASTRUCTURE=true separately if infra is pre-existing.
-DEPLOY_MLFLOW_OPERATOR="${DEPLOY_MLFLOW_OPERATOR:-false}"
+DEPLOY_MLFLOW_OPERATOR="${DEPLOY_MLFLOW_OPERATOR:-true}"
 MLFLOW_OPERATOR_OWNER="${MLFLOW_OPERATOR_OWNER:-opendatahub-io}"
 MLFLOW_OPERATOR_REPO="${MLFLOW_OPERATOR_REPO:-mlflow-operator}"
 MLFLOW_OPERATOR_BRANCH="${MLFLOW_OPERATOR_BRANCH:-main}"
@@ -148,15 +148,15 @@ ARTIFACT_BACKENDS="${ARTIFACT_BACKENDS:-${STORAGE_TYPE:-file,s3}}"
 STORAGE_TYPE="${STORAGE_TYPE:-file}"
 TEST_LABELS="${TEST_LABELS:-}"
 
-# Platform for infrastructure overlays: kind|openshift.
+# Platform for infrastructure overlays: base|openshift.
 # Auto-detected from DEPLOY_MLFLOW_OPERATOR when not explicitly set:
 #   DEPLOY_MLFLOW_OPERATOR=true  → openshift  (OLM/CSV path implies OpenShift)
-#   DEPLOY_MLFLOW_OPERATOR=false → kind       (kustomize-direct path implies Kind)
+#   DEPLOY_MLFLOW_OPERATOR=false → base       (kustomize-direct path implies base)
 if [ -z "${INFRASTRUCTURE_PLATFORM:-}" ]; then
     if [ "$DEPLOY_MLFLOW_OPERATOR" = "true" ]; then
         INFRASTRUCTURE_PLATFORM="openshift"
     else
-        INFRASTRUCTURE_PLATFORM="kind"
+        INFRASTRUCTURE_PLATFORM="base"
     fi
 fi
 
@@ -184,10 +184,9 @@ API_BASE="https://${MLFLOW_NAME}.${NAMESPACE}.svc.cluster.local:8443"
 
 # ─── Shared teardown (EXIT trap) ──────────────────────────────────────────────
 # Removes all resources created by this run: workspace namespaces (only those the
-# script itself created, not pre-existing ones), role bindings, the MLflow CR, and
-# any self-deployed infrastructure (PostgreSQL, SeaweedFS). Infrastructure teardown
-# attempts both backends unconditionally; --ignore-not-found makes it a no-op for
-# whichever was not deployed.
+# script itself created, not pre-existing ones), role bindings, the MLflow CR,
+# and any self-deployed infrastructure (PostgreSQL, SeaweedFS).
+# The DataScienceCluster mlflowoperator component is assumed to remain Managed.
 
 cleanup() {
     [ -n "$PF_PID" ] && kill -0 "$PF_PID" 2>/dev/null && kill "$PF_PID"
@@ -203,6 +202,8 @@ cleanup() {
     kubectl delete mlflow "$MLFLOW_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
     kubectl delete rolebinding "mlflow-permissions-${MLFLOW_NAME}" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
     kubectl delete clusterrolebinding "mlflow-auth-delegator-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
+    kubectl delete clusterrolebinding "mlflow-config-view-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
+    kubectl delete clusterrole "mlflow-config-reader-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
 
     if [ "$SKIP_INFRASTRUCTURE" != "true" ]; then
         local infra_overlay="$INFRASTRUCTURE_PLATFORM"
@@ -230,23 +231,12 @@ fi
 # (mlflow-operator-controller-manager), the CSV patch is skipped automatically.
 
 if [ "$DEPLOY_MLFLOW_OPERATOR" = "true" ] && [ "$SKIP_DEPLOYMENT" != "true" ]; then
-    _STANDALONE_MLFLOW_POD=$(kubectl get po -n "$NAMESPACE" \
-        -l "control-plane=controller-manager,app.kubernetes.io/name=mlflow-operator" \
-        --field-selector=status.phase=Running \
-        -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || true)
-
-    if [ -n "$_STANDALONE_MLFLOW_POD" ]; then
-        echo "Detected standalone MLflow operator pod ($_STANDALONE_MLFLOW_POD) — skipping CSV patch."
-        echo "  Operator is already running; proceeding with --skip-operator."
-        _OPERATOR_DEPLOYED=true
-    else
-        echo "Patching OLM CSV with MLflow operator manifests..."
-        if ! find_csv_and_update "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH"; then
-            echo "ERROR: Failed to patch CSV" >&2
-            exit 1
-        fi
-        _OPERATOR_DEPLOYED=true
+    echo "Patching OLM CSV with MLflow operator manifests..."
+    if ! find_csv_and_update "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH"; then
+        echo "ERROR: Failed to patch CSV" >&2
+        exit 1
     fi
+    _OPERATOR_DEPLOYED=true
 fi
 
 # ─── Suite runner ─────────────────────────────────────────────────────────────
@@ -264,6 +254,29 @@ setup_rbac() {
 
     kubectl create clusterrolebinding "mlflow-auth-delegator-${MLFLOW_NAME}" \
         --clusterrole=system:auth-delegator \
+        --serviceaccount="${NAMESPACE}:${MLFLOW_SA_NAME}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # Grant cluster-wide list/watch on mlflowconfigs so the MLflow server can look up
+    # namespace-specific artifact storage configs. The operator's Helm chart creates a
+    # ClusterRoleBinding for this, but in the CSV-patch path OLM may block ClusterRole
+    # creation. Create a self-contained ClusterRole here so we don't depend on
+    # mlflow-view (which may or may not exist) being present in the cluster.
+    kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mlflow-config-reader-${MLFLOW_NAME}
+rules:
+  - apiGroups: ["mlflow.kubeflow.org"]
+    resources: ["mlflowconfigs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+EOF
+    kubectl create clusterrolebinding "mlflow-config-view-${MLFLOW_NAME}" \
+        --clusterrole="mlflow-config-reader-${MLFLOW_NAME}" \
         --serviceaccount="${NAMESPACE}:${MLFLOW_SA_NAME}" \
         --dry-run=client -o yaml | kubectl apply -f -
 
@@ -365,7 +378,7 @@ run_suite() {
     fi
 
     # ── RBAC ────────────────────────────────────────────────────────────────────
-    # Idempotent; run each suite because the operator recreates the SA on CR apply.
+    # Applied after deploy.py so the SA exists; runs before tests execute.
     setup_rbac || return $?
 
     # ── Tracking URI ────────────────────────────────────────────────────────────

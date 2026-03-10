@@ -3,11 +3,11 @@
 #
 # Configured entirely via environment variables (see --help for the full list).
 # Delegates cluster-level deployment to deploy.py; on OpenShift/OLM clusters the
-# operator is patched via CSV instead (set DEPLOY_MLFLOW_OPERATOR=true).
+# operator is patched via CSV instead (default; set DEPLOY_MLFLOW_OPERATOR=false to skip).
 #
 # Platform support:
-#   Kind/vanilla Kubernetes: DEPLOY_MLFLOW_OPERATOR=false (default)
-#   OpenShift/OLM:           DEPLOY_MLFLOW_OPERATOR=true  — CSV patching via patch-csv.sh
+#   OpenShift/OLM:           DEPLOY_MLFLOW_OPERATOR=true (default) — CSV patching via patch-csv.sh
+#   Kind/vanilla Kubernetes: DEPLOY_MLFLOW_OPERATOR=false
 #
 # Multi-suite mode:
 #   By default the script runs tests twice — once with file storage and once with S3 —
@@ -68,7 +68,7 @@ Infrastructure image overrides:
 
 Operator / OpenShift:
   DEPLOY_MLFLOW_OPERATOR  true|false — patch the OLM CSV instead of deploying via kustomize;
-                          use on OpenShift/OLM clusters (default: false)
+                          use on OpenShift/OLM clusters (default: true)
   MLFLOW_OPERATOR_OWNER   GitHub owner for CSV manifest download (default: opendatahub-io)
   MLFLOW_OPERATOR_REPO    GitHub repo for CSV manifest download  (default: mlflow-operator)
   MLFLOW_OPERATOR_BRANCH  GitHub branch for CSV manifest download (default: main)
@@ -122,8 +122,7 @@ MLFLOW_OPERATOR_IMAGE="${MLFLOW_OPERATOR_IMAGE:-quay.io/opendatahub/mlflow-opera
 
 DB_TYPE="${DB_TYPE:-sqlite}"
 
-# Set DEPLOY_MLFLOW_OPERATOR=true on OpenShift clusters where the operator runs under OLM.
-# When true the script patches the OLM CSV instead of deploying the operator via kustomize
+# When true (default) the script patches the OLM CSV instead of deploying the operator via kustomize
 # and passes --skip-operator to deploy.py. Infrastructure is NOT automatically skipped —
 # set SKIP_INFRASTRUCTURE=true separately if infra is pre-existing.
 DEPLOY_MLFLOW_OPERATOR="${DEPLOY_MLFLOW_OPERATOR:-true}"
@@ -188,32 +187,37 @@ API_BASE="https://${MLFLOW_NAME}.${NAMESPACE}.svc.cluster.local:8443"
 
 cleanup() {
     [ -n "$PF_PID" ] && kill -0 "$PF_PID" 2>/dev/null && kill "$PF_PID"
-    for ws in $(echo "$WORKSPACE_LIST" | tr ',' ' '); do
-        ws=$(echo "$ws" | xargs); [ -z "$ws" ] && continue
-        kubectl delete rolebinding "mlflow-permissions-${MLFLOW_NAME}" -n "$ws" --ignore-not-found 2>/dev/null || true
-    done
-    # Only delete namespaces this run created; pre-existing namespaces are left intact.
-    for ws in $(echo "$_CREATED_WORKSPACES" | tr ',' ' '); do
-        ws=$(echo "$ws" | xargs); [ -z "$ws" ] && continue
-        kubectl delete namespace "$ws" --ignore-not-found 2>/dev/null || true
-    done
-    kubectl delete mlflow "$MLFLOW_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
-    kubectl delete rolebinding "mlflow-permissions-${MLFLOW_NAME}" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
-    kubectl delete clusterrolebinding "mlflow-auth-delegator-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
-    kubectl delete clusterrolebinding "mlflow-config-view-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
-    kubectl delete clusterrole "mlflow-config-reader-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
 
-    if [ "$SKIP_INFRASTRUCTURE" != "true" ]; then
-        local infra_overlay="$INFRASTRUCTURE_PLATFORM"
-        echo "  Removing self-deployed infrastructure..."
-        kustomize build "$REPO_ROOT/config/postgres/$infra_overlay" \
-            | kubectl delete --ignore-not-found -n "$NAMESPACE" -f - 2>/dev/null || true
-        export APPLICATION_CRD_ID=mlflow-pipelines \
-               PROFILE_NAMESPACE_LABEL=mlflow-profile \
-               S3_ADMIN_USER=kind-admin
-        kustomize build "$REPO_ROOT/config/seaweedfs/$infra_overlay" \
-            | envsubst '$NAMESPACE,$APPLICATION_CRD_ID,$PROFILE_NAMESPACE_LABEL,$S3_ADMIN_USER' \
-            | kubectl delete --ignore-not-found -f - 2>/dev/null || true
+    # Only clean up resources this run created. When SKIP_DEPLOYMENT=true the
+    # script was pointed at a pre-existing environment and must not disturb it.
+    if [ "$SKIP_DEPLOYMENT" != "true" ]; then
+        for ws in $(echo "$WORKSPACE_LIST" | tr ',' ' '); do
+            ws=$(echo "$ws" | xargs); [ -z "$ws" ] && continue
+            kubectl delete rolebinding "mlflow-permissions-${MLFLOW_NAME}" -n "$ws" --ignore-not-found 2>/dev/null || true
+        done
+        # Only delete namespaces this run created; pre-existing namespaces are left intact.
+        for ws in $(echo "$_CREATED_WORKSPACES" | tr ',' ' '); do
+            ws=$(echo "$ws" | xargs); [ -z "$ws" ] && continue
+            kubectl delete namespace "$ws" --ignore-not-found 2>/dev/null || true
+        done
+        kubectl delete mlflow "$MLFLOW_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+        kubectl delete rolebinding "mlflow-permissions-${MLFLOW_NAME}" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+        kubectl delete clusterrolebinding "mlflow-auth-delegator-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
+        kubectl delete clusterrolebinding "mlflow-config-view-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
+        kubectl delete clusterrole "mlflow-config-reader-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
+
+        if [ "$SKIP_INFRASTRUCTURE" != "true" ]; then
+            local infra_overlay="$INFRASTRUCTURE_PLATFORM"
+            echo "  Removing self-deployed infrastructure..."
+            kustomize build "$REPO_ROOT/config/postgres/$infra_overlay" \
+                | kubectl delete --ignore-not-found -n "$NAMESPACE" -f - 2>/dev/null || true
+            export APPLICATION_CRD_ID=mlflow-pipelines \
+                   PROFILE_NAMESPACE_LABEL=mlflow-profile \
+                   S3_ADMIN_USER=kind-admin
+            kustomize build "$REPO_ROOT/config/seaweedfs/$infra_overlay" \
+                | envsubst '$NAMESPACE,$APPLICATION_CRD_ID,$PROFILE_NAMESPACE_LABEL,$S3_ADMIN_USER' \
+                | kubectl delete --ignore-not-found -f - 2>/dev/null || true
+        fi
     fi
 }
 
@@ -375,6 +379,20 @@ run_suite() {
         _OPERATOR_DEPLOYED=true
     fi
 
+    # ── Between-suite teardown (runs on every exit path) ────────────────────────
+    # Registered here so it fires even when RBAC, health-check, or token steps fail,
+    # ensuring the port-forward and MLflow CR are cleaned up before the next suite.
+    # SKIP_CLEANUP only suppresses the final EXIT trap, not this per-suite reset.
+    local _suite_teardown_done=false
+    _suite_teardown() {
+        "$_suite_teardown_done" && return
+        _suite_teardown_done=true
+        [ -n "$PF_PID" ] && kill -0 "$PF_PID" 2>/dev/null && kill "$PF_PID" && PF_PID=""
+        # --wait ensures finalizers have completed before the next suite's deploy.py apply.
+        kubectl delete mlflow "$MLFLOW_NAME" -n "$NAMESPACE" --ignore-not-found --wait --timeout=120s 2>/dev/null || true
+    }
+    trap _suite_teardown RETURN
+
     # ── RBAC ────────────────────────────────────────────────────────────────────
     # Applied after deploy.py so the SA exists; runs before tests execute.
     setup_rbac || return $?
@@ -423,13 +441,6 @@ run_suite() {
     local suite_exit=0
     uv run pytest --junit-xml="$results_file" "${PYTEST_ARGS[@]}" || suite_exit=$?
     cd "$SCRIPT_DIR"
-
-    # ── Between-suite teardown ───────────────────────────────────────────────────
-    # Always remove the MLflow CR so the next suite gets a clean slate.
-    # SKIP_CLEANUP only suppresses the final EXIT trap, not this per-suite reset.
-    # --wait ensures finalizers have completed before the next suite's deploy.py apply.
-    [ -n "$PF_PID" ] && kill -0 "$PF_PID" 2>/dev/null && kill "$PF_PID" && PF_PID=""
-    kubectl delete mlflow "$MLFLOW_NAME" -n "$NAMESPACE" --ignore-not-found --wait --timeout=120s 2>/dev/null || true
 
     return "$suite_exit"
 }

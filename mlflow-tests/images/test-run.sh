@@ -3,11 +3,16 @@
 #
 # Configured entirely via environment variables (see --help for the full list).
 # Delegates cluster-level deployment to deploy.py; on OpenShift/OLM clusters the
-# operator is patched via CSV instead (set DEPLOY_MLFLOW_OPERATOR=true).
+# operator is patched via CSV instead (default; set DEPLOY_MLFLOW_OPERATOR=false to skip).
 #
 # Platform support:
-#   Kind/vanilla Kubernetes: DEPLOY_MLFLOW_OPERATOR=false (default)
-#   OpenShift/OLM:           DEPLOY_MLFLOW_OPERATOR=true  — CSV patching via patch-csv.sh
+#   OpenShift/OLM:           DEPLOY_MLFLOW_OPERATOR=true (default) — CSV patching via patch-csv.sh
+#   Kind/vanilla Kubernetes: DEPLOY_MLFLOW_OPERATOR=false
+#
+# Multi-suite mode:
+#   By default the script runs tests twice — once with file storage and once with S3 —
+#   sharing the operator setup, workspace namespaces, and RBAC across both runs.
+#   Control which backends run via ARTIFACT_BACKENDS (e.g. ARTIFACT_BACKENDS=file or ARTIFACT_BACKENDS=s3).
 
 set -euo pipefail
 
@@ -37,10 +42,12 @@ MLflow image:
   MLFLOW_IMAGE          Full image reference; overrides MLFLOW_TAG when set
   MLFLOW_TAG            Image tag for MLFLOW_IMAGE_REPO (default: master)
   MLFLOW_IMAGE_REPO     Image repository (default: quay.io/opendatahub/mlflow)
-  MLFLOW_OPERATOR_IMAGE Full MLflow operator image reference
+  MLFLOW_OPERATOR_IMAGE MLflow operator image (standalone/Kind path only; ODH/RHOAI operator image is hardcoded in the platform binary)
 
 Storage:
-  STORAGE_TYPE          Artifact storage backend: file|s3 (default: file)
+  STORAGE_TYPE          Legacy single-suite selector: file|s3. Prefer ARTIFACT_BACKENDS for
+                        multi-suite runs. When STORAGE_TYPE is set and ARTIFACT_BACKENDS is not,
+                        ARTIFACT_BACKENDS is derived from STORAGE_TYPE (backward compatibility).
   DB_TYPE               Metadata store backend: sqlite|postgres (default: sqlite)
 
   AWS_ACCESS_KEY_ID     S3 access key     (when STORAGE_TYPE=s3)
@@ -61,37 +68,45 @@ Infrastructure image overrides:
 
 Operator / OpenShift:
   DEPLOY_MLFLOW_OPERATOR  true|false — patch the OLM CSV instead of deploying via kustomize;
-                          use on OpenShift/OLM clusters (default: false)
+                          use on OpenShift/OLM clusters (default: true)
   MLFLOW_OPERATOR_OWNER   GitHub owner for CSV manifest download (default: opendatahub-io)
   MLFLOW_OPERATOR_REPO    GitHub repo for CSV manifest download  (default: mlflow-operator)
   MLFLOW_OPERATOR_BRANCH  GitHub branch for CSV manifest download (default: main)
-  INFRASTRUCTURE_PLATFORM Infrastructure overlay: kind|openshift
-                          (auto-derived from DEPLOY_MLFLOW_OPERATOR when not set)
+  INFRASTRUCTURE_PLATFORM Infrastructure overlay: base|openshift
+                          (default: openshift when DEPLOY_MLFLOW_OPERATOR=true, else base)
 
 Skip / control flags:
   SKIP_DEPLOYMENT       true|false — skip all cluster deployment (default: false)
   SKIP_OPERATOR         true|false — skip operator deployment only (default: false)
   SKIP_INFRASTRUCTURE   true|false — skip PostgreSQL/SeaweedFS deployment (default: false)
   SKIP_CLEANUP          true|false — leave resources in place after the run (default: false)
+  FAIL_FAST             true|false — stop after the first backend suite failure (default: true)
+                        Set to false to run all backends even if one fails.
 
 Other:
   NAMESPACE             Target namespace (default: opendatahub)
   MLFLOW_SA_NAME        Service account name created by the operator (default: mlflow-sa)
   IN_CLUSTER_MODE       true|false — false enables port-forwarding for local runs (default: true)
   workspaces            Comma-separated workspace namespace list (default: two random names)
-  TEST_RESULTS_DIR      Directory for JUnit XML output (default: /tmp/test-results)
+  TEST_RESULTS_DIR      Directory for JUnit XML output (default: /mlflow/results)
   DEPLOY_PY             Path to deploy.py (default: <repo>/.github/actions/deploy/deploy.py)
+  ARTIFACT_BACKENDS     Comma-separated artifact storage backends to test in sequence (default: file,s3)
+                        Each backend deploys a fresh MLflow CR, runs the full test suite, then
+                        removes the CR before the next backend runs.
+                        The operator, workspace namespaces, and RBAC are shared across all backends.
+
+Positional arguments:
+  Any arguments after the script name are forwarded verbatim to pytest.
+  e.g. bash test-run.sh -m smoke
+       bash test-run.sh -m "smoke or integration"
 EOF
 }
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     print_usage; exit 0
 fi
-if [ "$#" -gt 0 ]; then
-    echo "Error: $0 is configured via environment variables, not CLI flags." >&2
-    echo "Run '$0 --help' for the full list of variables." >&2
-    exit 1
-fi
+# Any positional arguments are forwarded verbatim to pytest (e.g. "-m smoke").
+PYTEST_ARGS=("$@")
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -105,14 +120,12 @@ MLFLOW_IMAGE_REPO="${MLFLOW_IMAGE_REPO:-quay.io/opendatahub/mlflow}"
 MLFLOW_IMAGE="${MLFLOW_IMAGE:-}"
 MLFLOW_OPERATOR_IMAGE="${MLFLOW_OPERATOR_IMAGE:-quay.io/opendatahub/mlflow-operator:odh-stable}"
 
-STORAGE_TYPE="${STORAGE_TYPE:-file}"
 DB_TYPE="${DB_TYPE:-sqlite}"
 
-# Set DEPLOY_MLFLOW_OPERATOR=true on OpenShift clusters where the operator runs under OLM.
-# When true the script patches the OLM CSV instead of deploying the operator via kustomize
+# When true (default) the script patches the OLM CSV instead of deploying the operator via kustomize
 # and passes --skip-operator to deploy.py. Infrastructure is NOT automatically skipped —
 # set SKIP_INFRASTRUCTURE=true separately if infra is pre-existing.
-DEPLOY_MLFLOW_OPERATOR="${DEPLOY_MLFLOW_OPERATOR:-false}"
+DEPLOY_MLFLOW_OPERATOR="${DEPLOY_MLFLOW_OPERATOR:-true}"
 MLFLOW_OPERATOR_OWNER="${MLFLOW_OPERATOR_OWNER:-opendatahub-io}"
 MLFLOW_OPERATOR_REPO="${MLFLOW_OPERATOR_REPO:-mlflow-operator}"
 MLFLOW_OPERATOR_BRANCH="${MLFLOW_OPERATOR_BRANCH:-main}"
@@ -121,16 +134,26 @@ SKIP_DEPLOYMENT="${SKIP_DEPLOYMENT:-false}"
 SKIP_OPERATOR="${SKIP_OPERATOR:-false}"
 SKIP_INFRASTRUCTURE="${SKIP_INFRASTRUCTURE:-false}"
 SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
+FAIL_FAST="${FAIL_FAST:-true}"
 IN_CLUSTER_MODE="${IN_CLUSTER_MODE:-true}"
 
-# Platform for infrastructure overlays.  Automatically set to "openshift" when
-# DEPLOY_MLFLOW_OPERATOR=true (OLM / OpenShift), otherwise defaults to "kind".
-# Override explicitly with PLATFORM=openshift|kind if needed.
+# Suites to run.  Each entry is an artifact storage backend (file|s3); the script
+# deploys a fresh MLflow CR per suite, runs the full test suite, then tears it down.
+# Backward compatibility: STORAGE_TYPE=<type> (old single-suite interface) is honoured
+# when ARTIFACT_BACKENDS is not explicitly set.
+ARTIFACT_BACKENDS="${ARTIFACT_BACKENDS:-${STORAGE_TYPE:-file,s3}}"
+# STORAGE_TYPE is set per-iteration by the main loop; this default is only used if
+# run_suite is somehow called outside the loop (e.g. during development/debugging).
+STORAGE_TYPE="${STORAGE_TYPE:-file}"
+
+# Platform for infrastructure overlays: base|openshift.
+# Defaults to openshift when the cluster has the OpenShift API (oc/routes available),
+# otherwise falls back to base. Can always be overridden explicitly.
 if [ -z "${INFRASTRUCTURE_PLATFORM:-}" ]; then
-    if [ "${DEPLOY_MLFLOW_OPERATOR}" = "true" ]; then
-        CLUSTER_PLATFORM="openshift"
+    if kubectl api-resources --api-group=route.openshift.io &>/dev/null 2>&1; then
+        INFRASTRUCTURE_PLATFORM="openshift"
     else
-        CLUSTER_PLATFORM="kind"
+        INFRASTRUCTURE_PLATFORM="base"
     fi
 fi
 
@@ -147,56 +170,51 @@ WORKSPACE_LIST="${workspaces:-workspace1-${RANDOM_SUFFIX},workspace2-${RANDOM_SU
 # Export so pytest (Config.WORKSPACES) reads the same names RBAC is set up for
 export workspaces="$WORKSPACE_LIST"
 
-_CREATED_WORKSPACES=""
 PF_PID=""
+_CREATED_WORKSPACES=""  # tracks only namespaces created by this run (not pre-existing)
+# Set to true after the first suite so subsequent suites skip re-deploying the operator.
+_OPERATOR_DEPLOYED=false
 
 MLFLOW_RESOLVED_IMAGE="${MLFLOW_IMAGE:-${MLFLOW_IMAGE_REPO}:${MLFLOW_TAG}}"
 
 API_BASE="https://${MLFLOW_NAME}.${NAMESPACE}.svc.cluster.local:8443"
 
-# ─── Cleanup ──────────────────────────────────────────────────────────────────
+# ─── Shared teardown (EXIT trap) ──────────────────────────────────────────────
+# Removes all resources created by this run: workspace namespaces (only those the
+# script itself created, not pre-existing ones), role bindings, the MLflow CR,
+# and any self-deployed infrastructure (PostgreSQL, SeaweedFS).
+# The DataScienceCluster mlflowoperator component is assumed to remain Managed.
 
 cleanup() {
-    echo "Cleaning up resources..."
+    [ -n "$PF_PID" ] && kill -0 "$PF_PID" 2>/dev/null && kill "$PF_PID"
 
-    if [ -n "$PF_PID" ] && kill -0 "$PF_PID" 2>/dev/null; then
-        echo "  Stopping port-forward (pid $PF_PID)"
-        kill "$PF_PID"
-    fi
+    # Only clean up resources this run created. When SKIP_DEPLOYMENT=true the
+    # script was pointed at a pre-existing environment and must not disturb it.
+    if [ "$SKIP_DEPLOYMENT" != "true" ]; then
+        for ws in $(echo "$WORKSPACE_LIST" | tr ',' ' '); do
+            ws=$(echo "$ws" | xargs); [ -z "$ws" ] && continue
+            kubectl delete rolebinding "mlflow-permissions-${MLFLOW_NAME}" -n "$ws" --ignore-not-found 2>/dev/null || true
+        done
+        # Only delete namespaces this run created; pre-existing namespaces are left intact.
+        for ws in $(echo "$_CREATED_WORKSPACES" | tr ',' ' '); do
+            ws=$(echo "$ws" | xargs); [ -z "$ws" ] && continue
+            kubectl delete namespace "$ws" --ignore-not-found 2>/dev/null || true
+        done
+        kubectl delete mlflow "$MLFLOW_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+        kubectl delete rolebinding "mlflow-permissions-${MLFLOW_NAME}" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+        kubectl delete clusterrolebinding "mlflow-auth-delegator-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
+        kubectl delete clusterrolebinding "mlflow-config-view-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
+        kubectl delete clusterrole "mlflow-config-reader-${MLFLOW_NAME}" --ignore-not-found 2>/dev/null || true
 
-    # Remove workspace role bindings first, then namespaces created by this script
-    for ws in $(echo "$WORKSPACE_LIST" | tr ',' ' '); do
-        ws=$(echo "$ws" | xargs)
-        [ -z "$ws" ] && continue
-        kubectl delete rolebinding "mlflow-permissions-${MLFLOW_NAME}" \
-            -n "$ws" --ignore-not-found 2>/dev/null || true
-    done
-    for ws in $(echo "$_CREATED_WORKSPACES" | tr ',' ' '); do
-        ws=$(echo "$ws" | xargs)
-        [ -z "$ws" ] && continue
-        kubectl delete namespace "$ws" --ignore-not-found 2>/dev/null || true
-    done
-
-    kubectl delete mlflow "$MLFLOW_NAME" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
-    kubectl delete rolebinding "mlflow-permissions-${MLFLOW_NAME}" \
-        -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
-    kubectl delete clusterrolebinding "mlflow-auth-delegator-${MLFLOW_NAME}" \
-        --ignore-not-found 2>/dev/null || true
-
-    # Tear down infrastructure only if it was deployed by this script
-    if [ "$SKIP_INFRASTRUCTURE" != "true" ]; then
-        _INFRA_OVERLAY="${CLUSTER_PLATFORM:-kind}"
-        if [ "$DB_TYPE" = "postgres" ] || [ "$DB_TYPE" = "postgresql" ]; then
-            echo "  Removing PostgreSQL..."
-            kustomize build "$REPO_ROOT/config/postgres/$_INFRA_OVERLAY" \
+        if [ "$SKIP_INFRASTRUCTURE" != "true" ]; then
+            local infra_overlay="$INFRASTRUCTURE_PLATFORM"
+            echo "  Removing self-deployed infrastructure..."
+            kustomize build "$REPO_ROOT/config/postgres/$infra_overlay" \
                 | kubectl delete --ignore-not-found -n "$NAMESPACE" -f - 2>/dev/null || true
-        fi
-        if [ "$STORAGE_TYPE" = "s3" ]; then
-            echo "  Removing SeaweedFS..."
             export APPLICATION_CRD_ID=mlflow-pipelines \
                    PROFILE_NAMESPACE_LABEL=mlflow-profile \
                    S3_ADMIN_USER=kind-admin
-            kustomize build "$REPO_ROOT/config/seaweedfs/$_INFRA_OVERLAY" \
+            kustomize build "$REPO_ROOT/config/seaweedfs/$infra_overlay" \
                 | envsubst '$NAMESPACE,$APPLICATION_CRD_ID,$PROFILE_NAMESPACE_LABEL,$S3_ADMIN_USER' \
                 | kubectl delete --ignore-not-found -f - 2>/dev/null || true
         fi
@@ -208,189 +226,246 @@ if [ "$SKIP_CLEANUP" != "true" ]; then
 fi
 
 # ─── CSV patching (OpenShift/OLM) ─────────────────────────────────────────────
-# Patches the parent *platform* operator's CSV to mount a volume with the MLflow
-# operator manifests from the given branch, then restarts it so it picks them up.
+# Done once before the suite loop — the MLflow operator manifests don't change
+# between suites, so there is no need to re-patch the CSV for each storage type.
 # This path applies only when the MLflow operator is embedded inside a platform
 # operator (ODH/RHOAI). When the MLflow operator runs standalone
 # (mlflow-operator-controller-manager), the CSV patch is skipped automatically.
 
 if [ "$DEPLOY_MLFLOW_OPERATOR" = "true" ] && [ "$SKIP_DEPLOYMENT" != "true" ]; then
-    _STANDALONE_MLFLOW_POD=$(kubectl get po -n "$NAMESPACE" \
-        -l "control-plane=controller-manager,app.kubernetes.io/name=mlflow-operator" \
-        --field-selector=status.phase=Running \
-        -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || true)
-
-    if [ -n "$_STANDALONE_MLFLOW_POD" ]; then
-        echo "Detected standalone MLflow operator pod ($_STANDALONE_MLFLOW_POD) — skipping CSV patch."
-        echo "  Operator is already running; proceeding with --skip-operator."
-    else
-        echo "Patching OLM CSV with MLflow operator manifests..."
-        if ! find_csv_and_update "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH"; then
-            echo "ERROR: Failed to patch CSV" >&2
-            exit 1
-        fi
+    echo "Patching OLM CSV with MLflow operator manifests..."
+    if ! find_csv_and_update "$MLFLOW_OPERATOR_OWNER" "$MLFLOW_OPERATOR_REPO" "$MLFLOW_OPERATOR_BRANCH"; then
+        echo "ERROR: Failed to patch CSV" >&2
+        exit 1
     fi
+    _OPERATOR_DEPLOYED=true
 fi
 
-# ─── Deploy ───────────────────────────────────────────────────────────────────
-# deploy.py handles: namespace creation, operator deployment (kustomize path),
-# infrastructure (postgres/seaweedfs), credentials secrets, and the MLflow CR.
+# ─── Suite runner ─────────────────────────────────────────────────────────────
 
-if [ "$SKIP_DEPLOYMENT" = "true" ]; then
-    echo "Skipping deployment (SKIP_DEPLOYMENT=true)"
-else
-    echo "Deploying MLflow via deploy.py..."
+setup_rbac() {
+    # The kubernetes-auth backend checks RBAC in the workspace namespace on every
+    # request, so the MLflow SA must have access in each workspace namespace.
+    # Additionally, the SA needs system:auth-delegator at the cluster level so it
+    # can perform TokenReview — a cluster-scoped operation not covered by
+    # namespace-scoped admin RoleBindings.
+    #
+    # Called at the start of each suite because the operator recreates the SA when
+    # the MLflow CR is (re)applied, so role bindings may need to be reapplied.
+    echo "  Setting up RBAC for ${MLFLOW_SA_NAME}..."
 
-    DEPLOY_ARGS=(
-        --namespace             "$NAMESPACE"
-        --mlflow-image          "$MLFLOW_RESOLVED_IMAGE"
-        --mlflow-operator-image "$MLFLOW_OPERATOR_IMAGE"
-        --platform              "$CLUSTER_PLATFORM"
-    )
+    kubectl create clusterrolebinding "mlflow-auth-delegator-${MLFLOW_NAME}" \
+        --clusterrole=system:auth-delegator \
+        --serviceaccount="${NAMESPACE}:${MLFLOW_SA_NAME}" \
+        --dry-run=client -o yaml | kubectl apply -f -
 
-    [ -n "${POSTGRES_IMAGE:-}"  ] && DEPLOY_ARGS+=(--postgres-image  "$POSTGRES_IMAGE")
-    [ -n "${SEAWEEDFS_IMAGE:-}" ] && DEPLOY_ARGS+=(--seaweedfs-image "$SEAWEEDFS_IMAGE")
-    [ -n "${DB_SSLMODE:-}"      ] && DEPLOY_ARGS+=(--postgres-sslmode "$DB_SSLMODE")
+    # Grant cluster-wide list/watch on mlflowconfigs so the MLflow server can look up
+    # namespace-specific artifact storage configs. The operator's Helm chart creates a
+    # ClusterRoleBinding for this, but in the CSV-patch path OLM may block ClusterRole
+    # creation. Create a self-contained ClusterRole here so we don't depend on
+    # mlflow-view (which may or may not exist) being present in the cluster.
+    kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mlflow-config-reader-${MLFLOW_NAME}
+rules:
+  - apiGroups: ["mlflow.kubeflow.org"]
+    resources: ["mlflowconfigs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+EOF
+    kubectl create clusterrolebinding "mlflow-config-view-${MLFLOW_NAME}" \
+        --clusterrole="mlflow-config-reader-${MLFLOW_NAME}" \
+        --serviceaccount="${NAMESPACE}:${MLFLOW_SA_NAME}" \
+        --dry-run=client -o yaml | kubectl apply -f -
 
-    # Operator deployment: skip when OLM manages it, or when explicitly requested
-    if [ "$DEPLOY_MLFLOW_OPERATOR" = "true" ] || [ "$SKIP_OPERATOR" = "true" ]; then
-        DEPLOY_ARGS+=(--skip-operator)
-    fi
+    for ws in $(echo "$WORKSPACE_LIST" | tr ',' ' '); do
+        ws=$(echo "$ws" | xargs)
+        [ -z "$ws" ] && continue
+        kubectl create rolebinding "mlflow-permissions-${MLFLOW_NAME}" \
+            --clusterrole=admin \
+            --serviceaccount="${NAMESPACE}:${MLFLOW_SA_NAME}" \
+            -n "$ws" \
+            --dry-run=client -o yaml | kubectl apply -f -
+    done
 
-    # Infrastructure deployment: skip on OpenShift (pre-existing) or when explicitly requested
-    if [ "$SKIP_INFRASTRUCTURE" = "true" ]; then
-        DEPLOY_ARGS+=(--skip-infrastructure)
-    fi
-
-    # Artifact storage
-    case "$STORAGE_TYPE" in
-        s3)
-            DEPLOY_ARGS+=(--artifact-storage s3)
-            [ -n "${AWS_ACCESS_KEY_ID:-}"     ] && DEPLOY_ARGS+=(--s3-access-key "$AWS_ACCESS_KEY_ID")
-            [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && DEPLOY_ARGS+=(--s3-secret-key "$AWS_SECRET_ACCESS_KEY")
-            [ -n "${BUCKET:-}"                ] && DEPLOY_ARGS+=(--s3-bucket     "$BUCKET")
-            [ -n "${S3_ENDPOINT_URL:-}"       ] && DEPLOY_ARGS+=(--s3-endpoint   "$S3_ENDPOINT_URL")
-            ;;
-        *)
-            DEPLOY_ARGS+=(--artifact-storage file)
-            ;;
-    esac
-
-    # Metadata store
-    case "$DB_TYPE" in
-        postgresql|postgres)
-            DEPLOY_ARGS+=(--backend-store postgres --registry-store postgres)
-            [ -n "${DB_HOST:-}"     ] && DEPLOY_ARGS+=(--postgres-host        "$DB_HOST")
-            [ -n "${DB_PORT:-}"     ] && DEPLOY_ARGS+=(--postgres-port        "$DB_PORT")
-            [ -n "${DB_USER:-}"     ] && DEPLOY_ARGS+=(--postgres-user        "$DB_USER")
-            [ -n "${DB_PASSWORD:-}" ] && DEPLOY_ARGS+=(--postgres-password    "$DB_PASSWORD")
-            [ -n "${DB_NAME:-}"     ] && DEPLOY_ARGS+=(--postgres-backend-db  "$DB_NAME"
-                                                        --postgres-registry-db "$DB_NAME")
-            ;;
-        *)
-            DEPLOY_ARGS+=(--backend-store sqlite --registry-store sqlite)
-            ;;
-    esac
-
-    uv run "$DEPLOY_PY" "${DEPLOY_ARGS[@]}"
-fi
-
-# ─── Workspace RBAC ───────────────────────────────────────────────────────────
-# The kubernetes-auth backend checks RBAC in the workspace namespace on every
-# request, so the MLflow SA must have access in each workspace namespace.
-#
-# Additionally, the SA needs system:auth-delegator at the cluster level so it
-# can perform TokenReview (validate Bearer tokens) — a cluster-scoped operation
-# that is not covered by namespace-scoped admin RoleBindings.
-
-echo "Setting up RBAC for ${MLFLOW_SA_NAME}..."
-
-# Grant cluster-level token validation (TokenReview / SubjectAccessReview)
-kubectl create clusterrolebinding "mlflow-auth-delegator-${MLFLOW_NAME}" \
-    --clusterrole=system:auth-delegator \
-    --serviceaccount="${NAMESPACE}:${MLFLOW_SA_NAME}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-echo "  Setting up workspace namespaces..."
-for ws in $(echo "$WORKSPACE_LIST" | tr ',' ' '); do
-    ws=$(echo "$ws" | xargs)
-    [ -z "$ws" ] && continue
-
-    if ! kubectl get namespace "$ws" &>/dev/null; then
-        echo "  Creating namespace: $ws"
-        kubectl create namespace "$ws"
-        _CREATED_WORKSPACES="${_CREATED_WORKSPACES:+${_CREATED_WORKSPACES},}${ws}"
-    fi
-
-    echo "  Granting ${MLFLOW_SA_NAME} admin access in: $ws"
     kubectl create rolebinding "mlflow-permissions-${MLFLOW_NAME}" \
         --clusterrole=admin \
         --serviceaccount="${NAMESPACE}:${MLFLOW_SA_NAME}" \
-        -n "$ws" \
+        -n "$NAMESPACE" \
         --dry-run=client -o yaml | kubectl apply -f -
-done
+}
 
-# Also grant access in the MLflow namespace itself (required by kubernetes-auth)
-kubectl create rolebinding "mlflow-permissions-${MLFLOW_NAME}" \
-    --clusterrole=admin \
-    --serviceaccount="${NAMESPACE}:${MLFLOW_SA_NAME}" \
-    -n "$NAMESPACE" \
-    --dry-run=client -o yaml | kubectl apply -f -
+run_suite() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Suite: storage=${STORAGE_TYPE} db=${DB_TYPE}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# ─── Tracking URI ─────────────────────────────────────────────────────────────
+    # ── Workspace namespaces (idempotent) ────────────────────────────────────────
+    for ws in $(echo "$WORKSPACE_LIST" | tr ',' ' '); do
+        ws=$(echo "$ws" | xargs); [ -z "$ws" ] && continue
+        if ! kubectl get namespace "$ws" &>/dev/null; then
+            kubectl create namespace "$ws" || return $?
+            _CREATED_WORKSPACES="${_CREATED_WORKSPACES:+${_CREATED_WORKSPACES},}${ws}"
+        fi
+    done
 
-if [ "$IN_CLUSTER_MODE" = "true" ]; then
-    export MLFLOW_TRACKING_URI="$API_BASE"
-    HEALTH_URL="${API_BASE}/mlflow/health"
-else
-    echo "Port-forwarding MLflow service to localhost:8443..."
-    kubectl port-forward "svc/${MLFLOW_NAME}" -n "$NAMESPACE" 8443:8443 &
-    PF_PID=$!
-    sleep 2
-    export MLFLOW_TRACKING_URI="https://localhost:8443"
-    HEALTH_URL="https://localhost:8443/mlflow/health"
-fi
-echo "MLFLOW_TRACKING_URI=$MLFLOW_TRACKING_URI"
+    # ── Deploy ──────────────────────────────────────────────────────────────────
+    if [ "$SKIP_DEPLOYMENT" = "true" ]; then
+        echo "  Skipping deployment (SKIP_DEPLOYMENT=true)"
+    else
+        echo "  Deploying MLflow (storage=${STORAGE_TYPE}) via deploy.py..."
 
-# ─── Health check ─────────────────────────────────────────────────────────────
+        local deploy_args=(
+            --namespace             "$NAMESPACE"
+            --mlflow-image          "$MLFLOW_RESOLVED_IMAGE"
+            --mlflow-operator-image "$MLFLOW_OPERATOR_IMAGE"
+            --platform              "$INFRASTRUCTURE_PLATFORM"
+        )
 
-echo "Waiting for MLflow health endpoint at $HEALTH_URL..."
-RETRY=0
-MAX_RETRIES=36  # 36 × 5 s = 3 min
-until curl -sk --max-time 5 -o /dev/null -w "%{http_code}" "$HEALTH_URL" | grep -qE "^(200|302)$"; do
-    RETRY=$((RETRY + 1))
-    if [ "$RETRY" -ge "$MAX_RETRIES" ]; then
-        echo "ERROR: MLflow endpoint did not become reachable within timeout" >&2
-        exit 1
+        [ -n "${POSTGRES_IMAGE:-}"  ] && deploy_args+=(--postgres-image  "$POSTGRES_IMAGE")
+        [ -n "${SEAWEEDFS_IMAGE:-}" ] && deploy_args+=(--seaweedfs-image "$SEAWEEDFS_IMAGE")
+        [ -n "${DB_SSLMODE:-}"      ] && deploy_args+=(--postgres-sslmode "$DB_SSLMODE")
+
+        # Skip operator when OLM manages it, when explicitly requested, or when it
+        # was already deployed by a previous suite in this run.
+        if [ "$DEPLOY_MLFLOW_OPERATOR" = "true" ] || \
+           [ "$SKIP_OPERATOR" = "true" ] || \
+           [ "$_OPERATOR_DEPLOYED" = "true" ]; then
+            deploy_args+=(--skip-operator)
+        fi
+
+        if [ "$SKIP_INFRASTRUCTURE" = "true" ]; then
+            deploy_args+=(--skip-infrastructure)
+        fi
+
+        case "$STORAGE_TYPE" in
+            s3)
+                deploy_args+=(--artifact-storage s3)
+                [ -n "${AWS_ACCESS_KEY_ID:-}"     ] && deploy_args+=(--s3-access-key "$AWS_ACCESS_KEY_ID")
+                [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && deploy_args+=(--s3-secret-key "$AWS_SECRET_ACCESS_KEY")
+                [ -n "${BUCKET:-}"                ] && deploy_args+=(--s3-bucket     "$BUCKET")
+                [ -n "${S3_ENDPOINT_URL:-}"       ] && deploy_args+=(--s3-endpoint   "$S3_ENDPOINT_URL")
+                ;;
+            file)
+                deploy_args+=(--artifact-storage file)
+                ;;
+            *)
+                echo "ERROR: Unsupported ARTIFACT_BACKENDS value: '${STORAGE_TYPE}'. Supported: file, s3" >&2
+                return 1
+                ;;
+        esac
+
+        case "$DB_TYPE" in
+            postgresql|postgres)
+                deploy_args+=(--backend-store postgres --registry-store postgres)
+                [ -n "${DB_HOST:-}"     ] && deploy_args+=(--postgres-host        "$DB_HOST")
+                [ -n "${DB_PORT:-}"     ] && deploy_args+=(--postgres-port        "$DB_PORT")
+                [ -n "${DB_USER:-}"     ] && deploy_args+=(--postgres-user        "$DB_USER")
+                [ -n "${DB_PASSWORD:-}" ] && deploy_args+=(--postgres-password    "$DB_PASSWORD")
+                [ -n "${DB_NAME:-}"     ] && deploy_args+=(--postgres-backend-db  "$DB_NAME"
+                                                            --postgres-registry-db "$DB_NAME")
+                ;;
+            *)
+                deploy_args+=(--backend-store sqlite --registry-store sqlite)
+                ;;
+        esac
+
+        uv run "$DEPLOY_PY" "${deploy_args[@]}" || return $?
+        _OPERATOR_DEPLOYED=true
     fi
-    echo "  Attempt $RETRY/$MAX_RETRIES — retrying in 5s..."
-    sleep 5
-done
-echo "MLflow endpoint is reachable"
 
-# ─── Kube token ───────────────────────────────────────────────────────────────
+    # ── Between-suite teardown (runs on every exit path) ────────────────────────
+    # Registered here so it fires even when RBAC, health-check, or token steps fail,
+    # ensuring the port-forward and MLflow CR are cleaned up before the next suite.
+    # SKIP_CLEANUP only suppresses the final EXIT trap, not this per-suite reset.
+    local _suite_teardown_done=false
+    _suite_teardown() {
+        "$_suite_teardown_done" && return
+        _suite_teardown_done=true
+        [ -n "$PF_PID" ] && kill -0 "$PF_PID" 2>/dev/null && kill "$PF_PID" && PF_PID=""
+        # --wait ensures finalizers have completed before the next suite's deploy.py apply.
+        kubectl delete mlflow "$MLFLOW_NAME" -n "$NAMESPACE" --ignore-not-found --wait --timeout=120s 2>/dev/null || true
+    }
+    trap _suite_teardown RETURN
 
-echo "Generating token for ${MLFLOW_SA_NAME}..."
-if ! kube_token=$(kubectl create token "$MLFLOW_SA_NAME" --namespace "$NAMESPACE"); then
-    echo "ERROR: Failed to create token for $MLFLOW_SA_NAME" >&2
-    exit 1
-fi
-export kube_token
+    # ── RBAC ────────────────────────────────────────────────────────────────────
+    # Applied after deploy.py so the SA exists; runs before tests execute.
+    setup_rbac || return $?
 
-# ─── Tests ────────────────────────────────────────────────────────────────────
+    # ── Tracking URI ────────────────────────────────────────────────────────────
+    if [ "$IN_CLUSTER_MODE" = "true" ]; then
+        export MLFLOW_TRACKING_URI="$API_BASE"
+        local health_url="${API_BASE}/mlflow/health"
+    else
+        echo "  Port-forwarding MLflow service to localhost:8443..."
+        kubectl port-forward "svc/${MLFLOW_NAME}" -n "$NAMESPACE" 8443:8443 &
+        PF_PID=$!
+        sleep 2
+        export MLFLOW_TRACKING_URI="https://localhost:8443"
+        local health_url="https://localhost:8443/mlflow/health"
+    fi
+    echo "  MLFLOW_TRACKING_URI=$MLFLOW_TRACKING_URI"
 
-TEST_RESULTS_DIR="${TEST_RESULTS_DIR:-/tmp/test-results}"
+    # ── Health check ────────────────────────────────────────────────────────────
+    echo "  Waiting for MLflow health endpoint at $health_url..."
+    local retry=0
+    local max_retries=36  # 36 × 5 s = 3 min
+    until curl -sk --max-time 5 -o /dev/null -w "%{http_code}" "$health_url" | grep -qE "^(200|302)$"; do
+        retry=$((retry + 1))
+        if [ "$retry" -ge "$max_retries" ]; then
+            echo "ERROR: MLflow endpoint did not become reachable within timeout" >&2
+            return 1
+        fi
+        echo "  Attempt $retry/$max_retries — retrying in 5s..."
+        sleep 5
+    done
+    echo "  MLflow endpoint is reachable"
+
+    # ── Kube token ──────────────────────────────────────────────────────────────
+    echo "  Generating token for ${MLFLOW_SA_NAME}..."
+    if ! kube_token=$(kubectl create token "$MLFLOW_SA_NAME" --namespace "$NAMESPACE"); then
+        echo "ERROR: Failed to create token for $MLFLOW_SA_NAME" >&2
+        return 1
+    fi
+    export kube_token
+
+    # ── Tests ───────────────────────────────────────────────────────────────────
+    local results_file="${TEST_RESULTS_DIR}/test-results-${STORAGE_TYPE}.xml"
+    echo "  Running tests (output: $results_file)..."
+    cd "$SCRIPT_DIR/.."
+    local suite_exit=0
+    uv run pytest --junit-xml="$results_file" "${PYTEST_ARGS[@]}" || suite_exit=$?
+    cd "$SCRIPT_DIR"
+
+    return "$suite_exit"
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+TEST_RESULTS_DIR="${TEST_RESULTS_DIR:-/mlflow/results}"
 mkdir -p "$TEST_RESULTS_DIR"
 
-echo "Running integration tests..."
-cd "$SCRIPT_DIR/.."
-uv run pytest --junit-xml="${TEST_RESULTS_DIR}/test-results.xml"
-TEST_EXIT_CODE=$?
+OVERALL_EXIT=0
+for STORAGE_TYPE in $(echo "$ARTIFACT_BACKENDS" | tr ',' ' '); do
+    STORAGE_TYPE=$(echo "$STORAGE_TYPE" | xargs)
+    [ -z "$STORAGE_TYPE" ] && continue
+    if ! run_suite; then
+        OVERALL_EXIT=1
+        [ "$FAIL_FAST" = "true" ] && break
+    fi
+done
 
+echo ""
 if ls "${TEST_RESULTS_DIR}"/*.xml &>/dev/null; then
     echo "JUnit XML reports generated in: $TEST_RESULTS_DIR"
+    ls "${TEST_RESULTS_DIR}"/*.xml
 else
     echo "WARNING: No XML reports found in: $TEST_RESULTS_DIR" >&2
 fi
 
-exit "$TEST_EXIT_CODE"
+exit "$OVERALL_EXIT"

@@ -67,9 +67,6 @@ patch_csv() {
         return 1
     fi
 
-    # Step 6: Wait for MLflow operator controller manager pod to be running
-    wait_for_mlflow_operator_controller_manager "$NAMESPACE_NAME" || return 1
-
     echo "Finished patching mlflow-operator component for CSV: $CSV_NAME"
 }
 
@@ -251,39 +248,6 @@ copy_mlflow_operator_manifests_to_pods() {
         echo "No custom MLflow operator manifests found at $base_config_path, operator will use default manifests"
         return 4
     fi
-}
-
-# Function to wait for MLflow operator controller manager pod to be ready
-wait_for_mlflow_operator_controller_manager() {
-    local NAMESPACE_NAME="$1"
-
-    echo "Waiting for MLflow operator controller manager pod to be ready..."
-    local mlflow_operator_pod_ready=false
-    local max_wait_time=300  # 5 minutes
-    local wait_interval=10   # Check every 10 seconds
-    local elapsed_time=0
-
-    while [[ $elapsed_time -lt $max_wait_time ]]; do
-        # Check if the MLflow operator controller manager pod exists and is running
-        local mlflow_operator_pod_status=$(kubectl get pods -n "$NAMESPACE_NAME" --field-selector=status.phase=Running --no-headers 2>/dev/null | grep "mlflow-operator-controller-manager" | wc -l)
-
-        if [[ $mlflow_operator_pod_status -gt 0 ]]; then
-            echo "✓ MLflow operator controller manager pod is running"
-            mlflow_operator_pod_ready=true
-            break
-        else
-            echo "Waiting for MLflow operator controller manager pod... (${elapsed_time}s/${max_wait_time}s)"
-            sleep $wait_interval
-            elapsed_time=$((elapsed_time + wait_interval))
-        fi
-    done
-
-    if [[ $mlflow_operator_pod_ready == false ]]; then
-        echo "ERROR: MLflow operator controller manager pod did not become ready within ${max_wait_time} seconds"
-        return 1
-    fi
-
-    return 0
 }
 
 find_csv_and_update() {

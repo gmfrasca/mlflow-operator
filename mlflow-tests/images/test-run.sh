@@ -435,7 +435,7 @@ run_suite() {
     export kube_token
 
     # ── Tests ───────────────────────────────────────────────────────────────────
-    local results_file="${TEST_RESULTS_DIR}/test-results-${STORAGE_TYPE}.xml"
+    local results_file="${TEST_RESULTS_DIR}/xunit_report_${STORAGE_TYPE}.xml"
     echo "  Running tests (output: $results_file)..."
     cd "$SCRIPT_DIR/.."
     local suite_exit=0
